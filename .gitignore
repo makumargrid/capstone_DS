@@ -1,0 +1,6 @@
+.env
+outputs/
+temp_mesh.stl
+output_model.step
+__pycache__/
+*.pyc
