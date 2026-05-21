@@ -1,3 +1,4 @@
+import math
 import cadquery as cq
 from src.logger import get_agent_logger
 
@@ -8,8 +9,8 @@ def execute_cad_code(code: str):
     logger.info("Setting up local scope for CadQuery execution...")
     local_scope = {}
     try:
-        # Execute the generated code with cadquery available in its scope
-        exec(code, {"cq": cq}, local_scope)
+        # Execute the generated code with cadquery and math available in its scope
+        exec(code, {"cq": cq, "math": math}, local_scope)
         solid = local_scope.get("result_solid")
         
         if solid is None:

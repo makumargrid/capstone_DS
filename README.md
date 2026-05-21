@@ -36,6 +36,7 @@ graph TD
 v1_capstone_ds/
 ├── Dockerfile              # Docker environment configuration with Conda and Pip
 ├── README.md               # System documentation (This file)
+├── capability.md           # System capabilities & module directory reference
 ├── pipeline.py             # Orchestrates the generation, execution, and QA loop
 ├── scratch_test.py         # Utility test script for MeshLib binding verification
 ├── .env                    # Environment variables (API keys, etc.) [Ignored]
@@ -46,6 +47,12 @@ v1_capstone_ds/
 │   ├── llm.py              # LLM client logic (Code generation & Dimension extraction)
 │   ├── logger.py           # Unified agentic logger configuration
 │   └── mesh_inspector.py   # Multi-stage MeshLib geometry & topology checking engine
+├── agents/                 # Google ADK agent configurations
+│   └── meshlib_agent/
+│       ├── __init__.py     # Package API exposure (root_agent, run_inspection)
+│       ├── agent.py        # Core ADK agent configuration & tools
+│       ├── sandbox_executor.py # Isolated mesh check subprocess sandbox
+│       └── observe.py      # Standalone logging/live debugging observation utility
 └── outputs/                # Timestamped run directories (logs, generated code, models, reports) [Ignored]
 ```
 
@@ -117,7 +124,7 @@ Because CadQuery and MeshLib depend on complex compiled C++ binaries, it is high
     ```
 
 ### Option B: Docker Setup (Recommended for Isolation)
-To run the entire pipeline inside a clean, reproducible containerized environment:
+To run the entire pipeline inside a clean, reproducible containerized environment. The Dockerfile compiles CadQuery and installs dependencies (`google-adk`, `fastapi`, `uvicorn`, `meshlib` etc.) required to execute the pipeline and serve the agent UI.
 
 1.  **Build the Docker image**:
     ```bash
@@ -138,6 +145,30 @@ To launch the centrifugal impeller test case:
 ```bash
 python pipeline.py
 ```
+
+### Google ADK Agent Console & Server Commands
+You can run the ADK Agent Web Console or the API Server locally using the workspace virtual environment. To share and view agent logs generated from `pipeline.py` or `observe.py` executions, point the commands to the shared SQLite database and use distinct ports to avoid port binding conflicts:
+
+*   **FastAPI Web UI Console (With Step-by-Step History Log):**
+    ```bash
+    ./agents/.agnts/bin/python -m google.adk.cli web --session_service_uri sqlite:///outputs/adk_sessions.db --port 8080 agents
+    ```
+    *Open `http://127.0.0.1:8080` in your browser. Click the **Sessions** tab in the sidebar and select a session to view the exact step-by-step reasoning timeline, generated code tools, execution logs, and final verdicts.*
+
+*   **FastAPI REST API Server (Programmatic Agent Access):**
+    ```bash
+    ./agents/.agnts/bin/python -m google.adk.cli api_server --session_service_uri sqlite:///outputs/adk_sessions.db --port 8000 agents
+    ```
+    *Serves the agent over standard REST endpoints at `http://127.0.0.1:8000` while logging run events to the same SQLite database.*
+
+### Live Console Observability & Debugging
+To inspect the internal reasoning, code generation, and sandboxed execution output of the MeshLib Agent in real-time with colorized terminal logging:
+
+1.  **Run the live inspector shell utility**:
+    ```bash
+    python agents/meshlib_agent/observe.py
+    ```
+2.  Follow the prompts or supply arguments to inspect specific STL files and view full agent thoughts, python code generation, raw sandboxed compiler tracebacks, and classification verdicts.
 
 ### Output Artifacts
 Inside `outputs/run_[timestamp]/`, you will find:

@@ -1,9 +1,12 @@
 import os
 import datetime
+import json
+# pyrefly: ignore [missing-import]
 from src.logger import get_agent_logger
 from src.llm import generate_cad_code, extract_expected_dimensions
 from src.cad_executor import execute_cad_code, export_solid
 from src.mesh_inspector import run_all_inspections
+from agents.meshlib_agent import run_inspection
 
 def run_pipeline(request_prompt: str, output_base_dir: str = "outputs"):
     # 1. Setup output directory
@@ -71,6 +74,37 @@ def run_pipeline(request_prompt: str, output_base_dir: str = "outputs"):
         logger.error(f"Failed to export models: {e}")
         return
     
+    # Run MeshLib ADK Agent Inspection
+    logger.info("Running MeshLib ADK Agent Inspection...")
+    try:
+        primitive_plan_dict = {
+            "expected_dims": expected_dimensions,
+            "min_wall_mm": 2.0,
+            "manufacturing_process": None,
+            "primitives": []
+        }
+        verdict = run_inspection(stl_filename, primitive_plan_dict)
+        
+        runner_logger = logger
+        runner_logger.info(f"AI Inspection - Passed: {verdict.get('overall_passed')}, Failure Class: {verdict.get('failure_class')}")
+        runner_logger.info(f"AI Inspection Summary: {verdict.get('engineer_summary')}")
+        
+        verdict_path = os.path.join(output_dir, "ai_inspection_verdict.json")
+        with open(verdict_path, "w") as f:
+            json.dump(verdict, f, indent=4)
+            
+        failure_class = verdict.get("failure_class")
+        if failure_class == "C":
+            runner_logger.warning(f"Class C (Design Intent Failure) detected. Repair recommendation: {verdict.get('repair_recommendation')}")
+        elif failure_class in ("A", "B"):
+            runner_logger.warning(f"Class {failure_class} defect detected. Candidate for auto-repair.")
+        elif failure_class == "D":
+            runner_logger.error("Class D (Ambiguous/Critical Failure) detected. Human review required.")
+        elif failure_class is None or verdict.get("overall_passed"):
+            runner_logger.info("All checks passed.")
+    except Exception as e:
+        logger.error(f"AI Inspection failed: {e}")
+    
     # 6. Advanced Inspection
     logger.info("[4/4] Running advanced MeshLib inspections...")
     try:
@@ -80,19 +114,23 @@ def run_pipeline(request_prompt: str, output_base_dir: str = "outputs"):
         logger.error(f"Inspection error: {e}")
 
 if __name__ == "__main__":
-    # ULTIMATE STRESS TEST: Centrifugal Compressor Impeller
-    # This is one of the most notoriously difficult geometries to generate correctly with code,
-    # involving lofts, sweeps along curved paths, and conical boolean intersections.
-    test_prompt = (
-        "Create a complex Centrifugal Compressor Impeller. "
-        "1. The main hub is a truncated cone with a base diameter of 100mm (at Z=0), a top diameter of 30mm (at Z=60), and a total height of 60mm. "
-        "2. The hub has a central bore hole of 15mm diameter going all the way through the Z axis for the driveshaft. "
-        "3. On the surface of the hub, create 7 swept curved aerodynamic blades. "
-        "4. Each blade should start at the base (radius 50mm) and curve upwards along the surface of the cone to the top (radius 15mm). "
-        "5. The blades should have a uniform thickness of 2mm, an outward protrusion (height off the hub surface) of 15mm at the base, tapering to 5mm at the top. "
-        "6. The blades should curve/twist around the Z axis by roughly 60 degrees from bottom to top to create the aerodynamic impeller shape. "
-        "7. Ensure the final object is a single unified solid, assigned to a variable named 'result_solid'. "
-        "DO NOT use hallucinated Selectors, stick to standard CadQuery operations like workplanes, extrude, sweep, or loft."
-    )
+    import sys
+    if len(sys.argv) > 1:
+        test_prompt = sys.argv[1]
+    else:
+        # ULTIMATE STRESS TEST: Centrifugal Compressor Impeller
+        # This is one of the most notoriously difficult geometries to generate correctly with code,
+        # involving lofts, sweeps along curved paths, and conical boolean intersections.
+        test_prompt = (
+            "Create a complex Centrifugal Compressor Impeller. "
+            "1. The main hub is a truncated cone with a base diameter of 100mm (at Z=0), a top diameter of 30mm (at Z=60), and a total height of 60mm. "
+            "2. The hub has a central bore hole of 15mm diameter going all the way through the Z axis for the driveshaft. "
+            "3. On the surface of the hub, create 7 swept curved aerodynamic blades. "
+            "4. Each blade should start at the base (radius 50mm) and curve upwards along the surface of the cone to the top (radius 15mm). "
+            "5. The blades should have a uniform thickness of 2mm, an outward protrusion (height off the hub surface) of 15mm at the base, tapering to 5mm at the top. "
+            "6. The blades should curve/twist around the Z axis by roughly 60 degrees from bottom to top to create the aerodynamic impeller shape. "
+            "7. Ensure the final object is a single unified solid, assigned to a variable named 'result_solid'. "
+            "DO NOT use hallucinated Selectors, stick to standard CadQuery operations like workplanes, extrude, sweep, or loft."
+        )
     
     run_pipeline(test_prompt)
