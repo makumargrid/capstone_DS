@@ -1,31 +1,46 @@
 # Advanced Agentic CAD Generation & Quality Assurance Pipeline
 
-An end-to-end, LLM-powered agentic CAD (Computer-Aided Design) pipeline. This system leverages the **Google GenAI SDK** (using Gemini 2.5 Pro) to synthesize parametric 3D models via **CadQuery**, executes the generated code in a isolated environment, exports production-ready models (STEP/STL), and runs a comprehensive multi-stage Quality Assurance (QA) suite using **MeshLib** to inspect and validate physical/geometric properties.
+An end-to-end, LLM-powered agentic CAD (Computer-Aided Design) pipeline. This system leverages the **Google GenAI SDK** (using Gemini 2.5 Pro) to synthesize parametric 3D models via **CadQuery**, executes the generated code in an isolated environment, exports production-ready models (STEP/STL), and runs a comprehensive Quality Assurance (QA) suite using both static invariant checks and an autonomous **MeshLib ADK Agent** to deeply inspect and validate physical/geometric properties.
+
+---
+
+## 🧠 Hybrid Architecture: Workflows Meets Agents
+
+This system is built using a **hybrid architecture** that embeds true autonomous agents within a reliable, deterministic workflow. This provides the safety and predictability of traditional software engineering while leveraging the dynamic reasoning and self-correcting capabilities of LLMs.
+
+### 1. The Macro Workflow (Deterministic)
+The master pipeline (`pipeline.py`) dictates the high-level sequence:
+`Prompt -> Extract Dimensions -> Generate CAD -> Export Files -> Run Invariant Checks -> Launch Autonomous Agent -> Final Verdict`.
+
+### 2. Agentic Pattern A: Self-Healing Code Generation
+During the CAD generation phase, if the LLM writes invalid CadQuery Python code that crashes during execution, the workflow catches the exception and feeds the stack trace back to the LLM. The LLM reflects on its error and dynamically rewrites the code in a self-healing loop (up to 3 attempts) until successful.
+
+### 3. Agentic Pattern B: The MeshLib Autonomous Agent
+During the QA phase, control flow is handed over to the **MeshLib Inspector Agent** (built with the Google ADK). This is a true autonomous agent:
+*   **Persona & Goal:** It is instructed to act as a QA Engineer, verifying complex dimensional constraints against a generated mesh.
+*   **Tool Use:** It independently writes custom Python inspection code using MeshLib APIs and executes it in an isolated sandbox.
+*   **ReAct Loop:** If its inspection script fails or throws a logic error, the agent reads the subprocess `stderr`, debugs its own code, and re-executes.
+*   **Decision Making:** It autonomously analyzes the measurement outputs and classifies failures logically (e.g., distinguishing between Class A topology errors vs. Class C design intent deviations).
 
 ---
 
 ## Architecture Overview
 
-The system operates as an autonomous agentic loop. When given a natural language design prompt, it extracts physical target constraints, writes CadQuery script code, executes it, catches and repairs errors iteratively, and runs deep mesh validation.
-
 ```mermaid
 graph TD
     A[Natural Language Prompt] --> B[Dimension Predictor LLM]
     A --> C[CAD Code Generator LLM]
-    B -->|Expected Bounding Box| F[Mesh Quality Inspector]
     C -->|Generated Python Code| D[Isolated CAD Executor]
     D -->|Success| E[Export STEP/STL]
-    D -->|Failure / Syntax / Logic Error| C2{Retry Loop < 3}
+    D -->|Failure / Syntax / Logic Error| C2{Self-Healing Retry Loop}
     C2 -->|Retry with Error Feedback| C
-    C2 -->|Max Retries Reached| Fail[Pipeline Aborted]
-    E -->|STL File| F
-    F -->|Watertightness & Volume Check| G[MeshLib Inspections]
-    F -->|Degenerate Triangle Area Check| G
-    F -->|Local Self-Intersection Check| G
-    F -->|Normals & Surface Orientation Check| G
-    F -->|Inward Ray-Casted Wall Thickness Check| G
-    F -->|Bounding Box vs. Plan Tolerance Check| G
-    G --> H[Unified JSON Inspection Report & pipeline.log]
+    E -->|STL File| F[Invariant Baseline Check]
+    F --> G[Launch MeshLib ADK Agent]
+    B -->|Expected Bounding Box| G
+    G -->|Generate QA Code| H[Subprocess Sandbox]
+    H -- Success --> I[Agent Classifies Verdict]
+    H -- Crash/Exception --> J{Agent Debugs & Rewrites Code}
+    J --> G
 ```
 
 ---
@@ -61,40 +76,34 @@ v1_capstone_ds/
 ## Module Breakdown
 
 ### 1. Master Pipeline Orchestrator (`pipeline.py`)
-The central controller of the system.
-*   **Job Directory Setup**: Creates a timestamped folder `outputs/run_YYYYMMDD_HHMMSS/` for every execution to store all transient inputs, logs, outputs, and validation reports.
-*   **Logging Initialization**: Bootstraps the runner logger directing outputs to the terminal and `pipeline.log`.
-*   **Target Extraction**: Extracts the expected 3D bounds and tolerance dynamically prior to drafting code.
-*   **Self-Healing Code Loop**: Invokes the LLM to write code. If execution fails, it captures stdout/stderr and injects it back to the LLM as error feedback, running up to 3 repair cycles.
+The deterministic controller of the system.
+*   **Job Directory Setup**: Creates a timestamped folder `outputs/run_YYYYMMDD_HHMMSS/` for every execution.
+*   **Target Extraction**: Extracts expected 3D bounds dynamically.
+*   **Self-Healing Code Loop**: Invokes the LLM to write CadQuery code. Iteratively repairs failing code up to 3 times based on execution stack traces.
 *   **Artifact Generation**: Automatically exports the solid to both boundary representation (`.step`) and tessellated mesh (`.stl`) formats.
-*   **QA Run**: Triggers the validation suite, saving the results in `inspection_report.json`.
-*   *Default Stress-Test Case*: Configured with a highly challenging aerodynamic centrifugal compressor impeller (requiring helical sweeps along conical profiles, variable blade thickness tapers, and complex boolean operations).
+*   **QA Run**: Triggers the static and autonomous validation suites.
 
 ### 2. LLM Engine (`src/llm.py`)
-Manages all interactions with the Gemini API using the new official `google-genai` SDK.
-*   `generate_cad_code(prompt, model_name)`: Sends the design query alongside a detailed engineering system prompt instructing Gemini to write standard CadQuery code, return *only* raw python, write to a predefined `result_solid` variable, and avoid hallucinated/deprecated string selectors (e.g. `LargestAreaSelector`).
-*   `extract_expected_dimensions(prompt, model_name)`: Prompts the LLM to act as a geometry parser, outputting a pure JSON object estimating target `x_mm`, `y_mm`, `z_mm`, and a dynamic `tolerance_mm` (dependent on prompt geometric complexity). Fallbacks are implemented to ensure pipeline robustness.
+Manages all interactions with the Gemini API using the new `google-genai` SDK.
+*   Generates standard CadQuery scripts based on engineering prompts.
+*   Extracts geometric dimension expectations dynamically into JSON form.
 
 ### 3. Isolated CAD Executor (`src/cad_executor.py`)
-Handles runtime evaluation of generated geometry scripts.
-*   `execute_cad_code(code)`: Instantiates a localized execution context. Runs python's dynamic `exec()` passing the `cadquery` module explicitly as `cq`. Ensures security isolation and parses the resulting workspace namespace to retrieve the `result_solid` object.
-*   `export_solid(solid, filename)`: Handles exporter routing for CadQuery, converting objects into industry-standard physical files (`.step` or `.stl`).
+Handles runtime evaluation of generated geometry scripts using Python's dynamic `exec()`. Evaluates the CadQuery code in a local namespace to ensure security and captures the final `result_solid` object.
 
-### 4. Mesh Quality & Inspection Engine (`src/mesh_inspector.py`)
-An advanced 3D inspection module utilizing **MeshLib (`meshlib.mrmeshpy`)** to ensure model validity, structural integrity, and manufacturing compliance.
-*   **Watertightness Check**: Confirms the mesh is topologically closed (`mesh.topology.isClosed()`) without gaps/holes, and calculates total volume in $mm^3$.
-*   **Degenerate Face Detection (`count_degenerate_faces`)**: Loops over all valid mesh faces, computes individual triangle surface areas using edge cross-products, and flags triangles with areas below `1e-6` $mm^2$, which lead to downstream CAM/slicing errors.
-*   **Self-Intersections Detection (`check_self_intersections`)**: Calls MeshLib's native `localFindSelfIntersections` to flag intersecting/overlapping triangles within the single solid.
-*   **Normals Consistency (`check_normals_consistency`)**: Uses `findDisorientedFaces` to detect flipped/non-manifold face normals, which cause rendering artifacts or printing errors.
-*   **Wall Thickness Analysis (`check_wall_thickness`)**: For up to 500 sampled triangles, it projects an inward ray from the triangle center along the negative normal using `rayMeshIntersect`. If the intersection distance is less than the threshold (default: `2.0` mm), the face is recorded as a critical thin wall region.
-*   **Dimensional Compliance (`check_dimensions_vs_plan`)**: Evaluates the model's actual bounding box dimensions (`mesh.computeBoundingBox()`) against the LLM's predicted target sizes, validating that each axis error lies within the calculated tolerance.
-*   **JSON Report Compilation**: Aggregates all metrics and boolean outcomes into a finalized `inspection_report.json` alongside a final `overall_valid` flag.
+### 4. MeshLib Autonomous Inspector Agent (`agents/meshlib_agent/`)
+An advanced autonomous agent built using the **Google ADK**.
+*   **`agent.py`**: The brain. Reads the physical blueprint, writes MeshLib python code to measure and verify properties, calls tools to execute that code, automatically repairs the code if it fails, and provides a final structural verdict.
+*   **`sandbox_executor.py`**: A vital security layer. Since MeshLib utilizes a C++ backend (OCCT) that will Segfault on bad memory allocations, the agent's code runs in a completely isolated subprocess. This protects the parent pipeline from fatal crashes.
 
-### 5. Unified Logger (`src/logger.py`)
-Implements an agentic log system.
-*   Standardizes log lines with: `[%(asctime)s] [%(levelname)s] [%(module)s:%(funcName)s] - %(message)s`.
-*   Directs human-readable info logs (`INFO`) to the console.
-*   Writes deep execution trace logs (`DEBUG`), including raw LLM interactions and math calculations, to `pipeline.log`.
+### 5. Advanced Static Inspection (`src/mesh_inspector.py`)
+Provides fast, invariant baseline checks using MeshLib before the agent assumes control.
+*   **Watertightness & Volume**: Confirms the mesh is topologically closed.
+*   **Self-Intersections & Degenerate Faces**: Flags structural mesh errors that cause rendering or printing issues.
+*   **Wall Thickness**: Uses raycasting to verify minimum structural limits.
+
+### 6. Unified Logger (`src/logger.py`)
+Implements an agentic log system routing INFO logs to the terminal and detailed DEBUG traces (including raw LLM outputs) to `pipeline.log`.
 
 ---
 
@@ -174,58 +183,7 @@ To inspect the internal reasoning, code generation, and sandboxed execution outp
 Inside `outputs/run_[timestamp]/`, you will find:
 *   `generated_code_attempt_[N].py`: The code drafted by the LLM on attempt N.
 *   `pipeline.log`: Complete debug log of all generation steps, CAD compilation, and inspection traces.
-*   `model.step`: Boundary representation model, ready for importing into professional CAD suites (SolidWorks, Fusion360, etc.).
+*   `model.step`: Boundary representation model, ready for importing into professional CAD suites.
 *   `model.stl`: Tessellated mesh, ready for 3D printing slicing.
-*   `inspection_report.json`: Detailed JSON structure indicating the geometric/topological status of the mesh.
-
-#### Example `inspection_report.json`
-```json
-{
-    "base_stats": {
-        "is_watertight": true,
-        "volume_mm3": 128504.32
-    },
-    "degenerate_faces": 0,
-    "self_intersections": {
-        "has_self_intersections": false,
-        "intersecting_face_count": 0
-    },
-    "normals_consistency": {
-        "normals_consistent": true,
-        "flipped_regions": 0
-    },
-    "wall_thickness": {
-        "min_wall_thickness_mm": 5.0,
-        "thin_region_count": 0,
-        "passes_minimum": true,
-        "thin_regions_sample": []
-    },
-    "dimensions_check": {
-        "dimensions": {
-            "x_mm": {
-                "expected": 100.0,
-                "measured": 100.0,
-                "delta_mm": 0.0,
-                "tolerance_mm": 5.0,
-                "passed": true
-            },
-            "y_mm": {
-                "expected": 100.0,
-                "measured": 100.0,
-                "delta_mm": 0.0,
-                "tolerance_mm": 5.0,
-                "passed": true
-            },
-            "z_mm": {
-                "expected": 60.0,
-                "measured": 60.0,
-                "delta_mm": 0.0,
-                "tolerance_mm": 5.0,
-                "passed": true
-            }
-        },
-        "all_dimensions_pass": true
-    },
-    "overall_valid": true
-}
-```
+*   `ai_inspection_verdict.json`: The final classification verdict dynamically generated by the ADK agent.
+*   `inspection_report.json`: Detailed static JSON structure indicating the geometric/topological baseline status of the mesh.
