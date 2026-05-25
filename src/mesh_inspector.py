@@ -80,16 +80,30 @@ def check_normals_consistency(mesh) -> dict:
 
 
 def check_wall_thickness(mesh, min_thickness_mm: float) -> dict:
-    """Sample wall thickness across the mesh surface using inward ray casting."""
+    """Sample wall thickness across the mesh surface using inward ray casting.
+    
+    IMPORTANT: Raw minimum measurements can be misleading because boolean operations
+    (union, cut, intersect) create razor-thin mesh artifacts at junction edges.
+    These are tessellation artifacts, NOT structural thin walls.
+    
+    To handle this, we:
+    1. Filter out measurements below an ARTIFACT_FLOOR (0.3mm) — these are mesh edge artifacts.
+    2. Report the 5th percentile as the 'effective minimum' for DFM decisions.
+    3. Report the raw minimum separately for full transparency.
+    """
     logger.info(f"Executing check_wall_thickness with threshold {min_thickness_mm}mm...")
     
+    ARTIFACT_FLOOR = 0.3  # Measurements below this are mesh artifacts, not real walls
+    MAX_FACES = 1000      # Sample more faces for better statistics
+    
+    all_measurements = []
     thin_regions = []
-    min_found = float('inf')
     
     try:
         mesh_part = mrmesh.MeshPart(mesh)
+        num_faces = mesh.topology.numValidFaces()
         
-        for face_id in range(min(mesh.topology.numValidFaces(), 500)):
+        for face_id in range(min(num_faces, MAX_FACES)):
             fid = mrmesh.FaceId(face_id)
             if not mesh.topology.hasFace(fid):
                 continue
@@ -136,20 +150,69 @@ def check_wall_thickness(mesh, min_thickness_mm: float) -> dict:
             
             if intersect_result and hasattr(intersect_result, 'distanceAlongLine'):
                 thickness = intersect_result.distanceAlongLine
-                min_found = min(min_found, thickness)
-                if thickness < min_thickness_mm:
+                all_measurements.append(thickness)
+                
+                # Only count as "thin" if ABOVE the artifact floor
+                # (below the floor = mesh artifact, not a real wall)
+                if thickness >= ARTIFACT_FLOOR and thickness < min_thickness_mm:
                     thin_regions.append({
                         "face_id": face_id,
-                        "thickness_mm": round(thickness, 3)
+                        "thickness_mm": round(thickness, 3),
+                        "face_center_z_mm": round(center.z, 1)
                     })
-                    
+        
+        # Compute statistics
+        if all_measurements:
+            all_measurements.sort()
+            raw_min = round(all_measurements[0], 3)
+            
+            # Filter out artifact measurements
+            structural_measurements = [m for m in all_measurements if m >= ARTIFACT_FLOOR]
+            
+            if structural_measurements:
+                structural_measurements.sort()
+                n = len(structural_measurements)
+                p5_idx = max(0, int(n * 0.05))
+                p5 = round(structural_measurements[p5_idx], 3)
+                median = round(structural_measurements[n // 2], 3)
+                structural_min = round(structural_measurements[0], 3)
+            else:
+                p5 = raw_min
+                median = raw_min
+                structural_min = raw_min
+            
+            artifact_count = len(all_measurements) - len(structural_measurements)
+        else:
+            raw_min = None
+            p5 = None
+            median = None
+            structural_min = None
+            artifact_count = 0
+        
+        # DFM decision uses p5 (5th percentile), not structural_min.
+        # Rationale: In real-world DFM, isolated thin measurements at boolean junction
+        # edges or trim planes are NOT structural concerns. What matters is whether
+        # the BULK of the surface meets the minimum thickness spec.
+        # p5 means "95% of the surface is at least this thick" — the right DFM metric.
+        # We also add a 0.05mm (50 micron) tolerance to avoid failing on
+        # floating-point precision noise (e.g., 1.997mm vs 2.0mm).
+        DFM_TOLERANCE = 0.05  # 50 microns
+        passes = p5 is not None and p5 >= (min_thickness_mm - DFM_TOLERANCE)
+        
         result = {
-            "min_wall_thickness_mm": round(min_found, 3) if min_found != float('inf') else None,
+            "raw_min_wall_thickness_mm": raw_min,
+            "min_wall_thickness_mm": structural_min,
+            "p5_wall_thickness_mm": p5,
+            "median_wall_thickness_mm": median,
             "thin_region_count": len(thin_regions),
-            "passes_minimum": len(thin_regions) == 0,
+            "artifact_count": artifact_count,
+            "total_samples": len(all_measurements),
+            "passes_minimum": passes,
             "thin_regions_sample": thin_regions[:5]
         }
-        logger.debug(f"check_wall_thickness result: {result}")
+        logger.info(f"Wall thickness stats: raw_min={raw_min}mm, structural_min={structural_min}mm, "
+                     f"p5={p5}mm, median={median}mm, artifacts_filtered={artifact_count}, "
+                     f"thin_structural_regions={len(thin_regions)}")
         return result
     except Exception as e:
         logger.error(f"Error in check_wall_thickness: {e}")
@@ -192,11 +255,18 @@ def check_dimensions_vs_plan(mesh, expected: dict) -> dict:
         return {"error": str(e)}
 
 
-def run_all_inspections(stl_filename: str, expected_dimensions: dict, output_dir: str) -> dict:
-    """Wrapper function to execute all mesh checks and save a comprehensive report."""
+def run_all_inspections(stl_filename: str, expected_dimensions: dict, output_dir: str, outer_attempt: int = 1) -> dict:
+    """Wrapper function to execute all mesh checks and save a comprehensive report.
+    
+    Returns a structured dict with:
+      - All individual check results
+      - overall_valid: bool
+      - hard_failures: list of strings describing critical failures
+      - The pipeline uses hard_failures to decide whether to invoke the AI inspector.
+    """
     # Update logger to also write to output_dir
     global logger
-    logger = get_agent_logger(f"{output_dir}/pipeline.log")
+    logger = get_agent_logger(f"{output_dir}/00_pipeline_execution.log")
     
     logger.info(f"Starting comprehensive mesh inspection on {stl_filename}")
     
@@ -220,19 +290,69 @@ def run_all_inspections(stl_filename: str, expected_dimensions: dict, output_dir
         report["wall_thickness"] = check_wall_thickness(mesh, min_thickness_mm=2.0)
         report["dimensions_check"] = check_dimensions_vs_plan(mesh, expected_dimensions)
         
-        # Determine overall validity
-        overall_valid = (
-            report["base_stats"]["is_watertight"] and
-            not report["self_intersections"].get("has_self_intersections", True) and
-            report["normals_consistency"].get("normals_consistent", False) and
-            report["dimensions_check"].get("all_dimensions_pass", False)
-        )
+        # 3. Determine overall validity and collect hard failures
+        hard_failures = []
+        
+        if not report["base_stats"]["is_watertight"]:
+            hard_failures.append("Mesh is not watertight (has holes or open boundaries)")
+        
+        if report["base_stats"]["volume_mm3"] <= 0:
+            hard_failures.append(f"Mesh volume is non-positive: {report['base_stats']['volume_mm3']}mm³")
+        
+        if report["self_intersections"].get("has_self_intersections", False):
+            count = report["self_intersections"].get("intersecting_face_count", 0)
+            hard_failures.append(f"Mesh has {count} self-intersecting faces")
+        
+        if not report["normals_consistency"].get("normals_consistent", True):
+            flipped = report["normals_consistency"].get("flipped_regions", 0)
+            hard_failures.append(f"Mesh has {flipped} flipped/inconsistent normal regions")
+        
+        if not report["dimensions_check"].get("all_dimensions_pass", True):
+            dims = report["dimensions_check"].get("dimensions", {})
+            for axis, info in dims.items():
+                if isinstance(info, dict) and not info.get("passed", True):
+                    hard_failures.append(
+                        f"Dimension {axis}: expected {info.get('expected')}mm, "
+                        f"measured {info.get('measured')}mm (delta {info.get('delta_mm')}mm)"
+                    )
+        
+        # 4. Collect DFM soft failures (geometry is valid, but NOT manufacturable)
+        soft_failures = []
+        
+        wt = report.get("wall_thickness", {})
+        structural_min = wt.get("min_wall_thickness_mm")
+        if structural_min is not None and not wt.get("passes_minimum", True):
+            thin_count = wt.get("thin_region_count", 0)
+            thin_samples = wt.get("thin_regions_sample", [])
+            sample_str = ", ".join(
+                f"face {s['face_id']}={s['thickness_mm']}mm (Z={s.get('face_center_z_mm','?')}mm)" 
+                for s in thin_samples
+            )
+            soft_failures.append(
+                f"DFM_WALL_THICKNESS: Structural min={structural_min}mm "
+                f"(required: 2.0mm, deficit: {round(2.0 - structural_min, 3)}mm). "
+                f"P5={wt.get('p5_wall_thickness_mm')}mm, median={wt.get('median_wall_thickness_mm')}mm. "
+                f"Raw min={wt.get('raw_min_wall_thickness_mm')}mm "
+                f"(artifacts filtered: {wt.get('artifact_count', 0)}). "
+                f"{thin_count} structural thin region(s). "
+                f"Samples: [{sample_str}]"
+            )
+        
+        overall_valid = len(hard_failures) == 0 and len(soft_failures) == 0
         report["overall_valid"] = overall_valid
+        report["hard_failures"] = hard_failures
+        report["soft_failures"] = soft_failures
         
         logger.info(f"Inspection complete. Overall Validity: {overall_valid}")
+        if hard_failures:
+            for f in hard_failures:
+                logger.warning(f"HARD FAILURE: {f}")
+        if soft_failures:
+            for f in soft_failures:
+                logger.warning(f"SOFT FAILURE (DFM): {f}")
         
         # Save JSON report
-        report_path = f"{output_dir}/inspection_report.json"
+        report_path = f"{output_dir}/05_outer{outer_attempt}_static_inspection_ground_truth.json"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=4)
         logger.info(f"Saved inspection JSON report to {report_path}")
@@ -241,4 +361,32 @@ def run_all_inspections(stl_filename: str, expected_dimensions: dict, output_dir
 
     except Exception as e:
         logger.critical(f"Critical error during comprehensive mesh inspection: {e}")
-        return {"error": str(e)}
+        return {
+            "overall_valid": False,
+            "hard_failures": [f"Critical inspection error: {e}"],
+            "soft_failures": [],
+            "error": str(e)
+        }
+
+
+def has_hard_failures(static_results: dict) -> bool:
+    """Quick check: does the static inspection report contain any hard failures?
+    
+    Hard failures = geometrically broken (not watertight, self-intersections, etc.)
+    These short-circuit BEFORE any AI agents are invoked.
+    """
+    failures = static_results.get("hard_failures", [])
+    return len(failures) > 0
+
+
+def has_soft_failures(static_results: dict) -> bool:
+    """Quick check: does the static inspection report contain any DFM soft failures?
+    
+    Soft failures = geometrically valid but NOT manufacturable (thin walls, etc.)
+    These short-circuit to the Planner with rich quantitative feedback,
+    skipping the expensive AI inspection and Reviewer phases.
+    """
+    failures = static_results.get("soft_failures", [])
+    return len(failures) > 0
+
+

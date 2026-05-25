@@ -1,189 +1,113 @@
 # Advanced Agentic CAD Generation & Quality Assurance Pipeline
 
-An end-to-end, LLM-powered agentic CAD (Computer-Aided Design) pipeline. This system leverages the **Google GenAI SDK** (using Gemini 2.5 Pro) to synthesize parametric 3D models via **CadQuery**, executes the generated code in an isolated environment, exports production-ready models (STEP/STL), and runs a comprehensive Quality Assurance (QA) suite using both static invariant checks and an autonomous **MeshLib ADK Agent** to deeply inspect and validate physical/geometric properties.
+Welcome! This repository hosts an end-to-end, adversarial multi-agent pipeline for generating and verifying Computer-Aided Design (CAD) models. 
+
+This system uses **Google Gemini 3.1 Pro** via the **Google ADK** to write parametric 3D modeling code, and then it unleashes two adversarial AI agents to inspect, critique, and debug the resulting 3D models before delivering the final `.step` files to you.
 
 ---
 
-## 🧠 Hybrid Architecture: Workflows Meets Agents
+## 🧠 The "Adversarial Multi-Agent" Architecture Explained
 
-This system is built using a **hybrid architecture** that embeds true autonomous agents within a reliable, deterministic workflow. This provides the safety and predictability of traditional software engineering while leveraging the dynamic reasoning and self-correcting capabilities of LLMs.
+Most AI coding agents have a major flaw: **Hallucination**. If you ask an AI to write code to build a 2mm thick wall, it might write code that builds a 1mm wall, but confidently *tell you* it built a 2mm wall. If you ask another AI to review it, that AI might just look at the code, assume it works, and "rubber-stamp" it. 
 
-### 1. The Macro Workflow (Deterministic)
-The master pipeline (`pipeline.py`) dictates the high-level sequence:
-`Prompt -> Extract Dimensions -> Generate CAD -> Export Files -> Run Invariant Checks -> Launch Autonomous Agent -> Final Verdict`.
+We solve this using a multi-agent system built on three core principles:
 
-### 2. Agentic Pattern A: Self-Healing Code Generation
-During the CAD generation phase, if the LLM writes invalid CadQuery Python code that crashes during execution, the workflow catches the exception and feeds the stack trace back to the LLM. The LLM reflects on its error and dynamically rewrites the code in a self-healing loop (up to 3 attempts) until successful.
+### 1. Deterministic Ground Truth
+Before the AI is allowed to "think" about the 3D model, we run hardcoded, mathematical C++ algorithms (`mesh_inspector.py`) on the generated mesh. This checks for objective physical realities: Is the mesh watertight? Does it have a volume? What is its actual, measurable minimum wall thickness? This provides a mathematically unshakeable "ground truth".
 
-### 3. Agentic Pattern B: The MeshLib Autonomous Agent
-During the QA phase, control flow is handed over to the **MeshLib Inspector Agent** (built with the Google ADK). This is a true autonomous agent:
-*   **Persona & Goal:** It is instructed to act as a QA Engineer, verifying complex dimensional constraints against a generated mesh.
-*   **Tool Use:** It independently writes custom Python inspection code using MeshLib APIs and executes it in an isolated sandbox.
-*   **ReAct Loop:** If its inspection script fails or throws a logic error, the agent reads the subprocess `stderr`, debugs its own code, and re-executes.
-*   **Decision Making:** It autonomously analyzes the measurement outputs and classifies failures logically (e.g., distinguishing between Class A topology errors vs. Class C design intent deviations).
+### 2. Information Asymmetry (Anti-Rubber-Stamping)
+The pipeline features two AI agents in the review phase:
+1.  **The MeshLib Inspector Agent**: This agent writes custom Python scripts to measure the 3D model. However, it is prone to hallucination (it might write a bad script and draw the wrong conclusion). It reports its findings.
+2.  **The Adversarial Reviewer Agent**: This agent is the ultimate judge. **It never sees the original code.** It is only given your initial request, the deterministic ground truth (from step 1), and the MeshLib Inspector's findings. 
+
+### 3. Adversarial Verification
+Because the Reviewer Agent has the mathematical ground truth, it can instantly catch the Inspector Agent if it lies! 
+If the Inspector claims *"The wall thickness is 2.0mm and passes"*, but the ground truth says *"Minimum wall thickness is 0.9mm"*, the Reviewer Agent flags the discrepancy, overrules the Inspector, and forces the system to **REDESIGN** the model.
 
 ---
 
-## Architecture Overview
+## The 6-Phase Pipeline Workflow
+
+When you run the pipeline, it executes the following phases in a loop (up to 3 times) until the Reviewer Agent approves the design:
 
 ```mermaid
-graph TD
-    A[Natural Language Prompt] --> B[Dimension Predictor LLM]
-    A --> C[CAD Code Generator LLM]
-    C -->|Generated Python Code| D[Isolated CAD Executor]
-    D -->|Success| E[Export STEP/STL]
-    D -->|Failure / Syntax / Logic Error| C2{Self-Healing Retry Loop}
-    C2 -->|Retry with Error Feedback| C
-    E -->|STL File| F[Invariant Baseline Check]
-    F --> G[Launch MeshLib ADK Agent]
-    B -->|Expected Bounding Box| G
-    G -->|Generate QA Code| H[Subprocess Sandbox]
-    H -- Success --> I[Agent Classifies Verdict]
-    H -- Crash/Exception --> J{Agent Debugs & Rewrites Code}
-    J --> G
+flowchart TD
+    A["User Prompt"] --> B["Phase 1: Planning"]
+    B --> B1["Planner Agent"]
+    B1 -->|"Unclear?"| B2["ask_user tool → User"]
+    B2 --> B1
+    B1 --> B3["Output: Construction Plan + CadQuery Code"]
+    B3 --> C["Phase 2: Execution"]
+    C --> C1["Isolated Sandbox"]
+    C1 -->|"Syntax Error"| C2["Inner Retry Loop"]
+    C2 --> B1
+    C1 -->|"Success"| E["Phase 3: Export STL + STEP"]
+    E --> F["Phase 4: Static Checks (Deterministic)"]
+    F --> F1["mesh_inspector.py"]
+    F1 -->|"Hard Failure (e.g. not watertight)"| G["Short-circuit back to Planner"]
+    G --> B1
+    F1 -->|"Passes Basics"| H["Phase 5: AI Inspection"]
+    H --> H1["MeshLib Inspector Agent (writes custom scripts)"]
+    H1 --> I["Phase 6: Adversarial Review"]
+    I --> I1["Reviewer Agent"]
+    I1 -->|"APPROVED"| J["✅ Pipeline Complete"]
+    I1 -->|"REDESIGN"| K["Feed critique back to Planner for Next Loop"]
+    K --> B1
+    I1 -->|"HALT"| L["🛑 Human Review Required"]
 ```
 
 ---
 
-## Directory Structure
+## 📂 Understanding the Output Files
 
-```directory
-v1_capstone_ds/
-├── Dockerfile              # Docker environment configuration with Conda and Pip
-├── README.md               # System documentation (This file)
-├── capability.md           # System capabilities & module directory reference
-├── pipeline.py             # Orchestrates the generation, execution, and QA loop
-├── scratch_test.py         # Utility test script for MeshLib binding verification
-├── .env                    # Environment variables (API keys, etc.) [Ignored]
-├── .gitignore              # Git ignore rules for outputs and virtual files
-├── src/                    # Source code directory
-│   ├── __init__.py
-│   ├── cad_executor.py     # Isolated execution of CadQuery python scripts
-│   ├── llm.py              # LLM client logic (Code generation & Dimension extraction)
-│   ├── logger.py           # Unified agentic logger configuration
-│   └── mesh_inspector.py   # Multi-stage MeshLib geometry & topology checking engine
-├── agents/                 # Google ADK agent configurations
-│   └── meshlib_agent/
-│       ├── __init__.py     # Package API exposure (root_agent, run_inspection)
-│       ├── agent.py        # Core ADK agent configuration & tools
-│       ├── sandbox_executor.py # Isolated mesh check subprocess sandbox
-│       └── observe.py      # Standalone logging/live debugging observation utility
-└── outputs/                # Timestamped run directories (logs, generated code, models, reports) [Ignored]
-```
+Every time you run the pipeline, it creates a new folder in `outputs/` named with a timestamp (e.g., `run_20260523_101816`). 
+
+Inside this folder, **every single file is chronologically numbered and tagged with its "Loop Iteration"** (e.g., `outer1`, `outer2`). This allows you to track exactly what the AI did on the first attempt, why it failed, and what it did to fix it on the second attempt!
+
+**The Master Execution Log**
+*   `00_pipeline_execution.log`: The unified text log showing every step, error, and decision across the entire pipeline. 
+*   `01_design_brief.json`: The mathematical dimensions the AI extracted from your original prompt.
+
+**The Loop Files (Repeated for Iteration 1, 2, 3...)**
+*   `02_outer[X]_planner_construction_plan.txt`: The text plan the CAD Engineer AI wrote *before* it wrote any code.
+*   `03_outer[X]_inner[Y]_planner_generated_cad_code.py`: The actual Python CadQuery code the AI generated.
+*   `04_outer[X]_exported_model.step`: The professional CAD solid model for this attempt.
+*   `04_outer[X]_exported_model.stl`: The tessellated mesh model for this attempt.
+*   `05_outer[X]_static_inspection_ground_truth.json`: The deterministic mathematical measurements of the model.
+*   `06a_outer[X]_ai_inspector_findings.json`: The AI Inspector's report on the model.
+*   `06b_outer[X]_ai_inspector_conversation_trace.json`: The raw log of the AI Inspector's thought process.
+*   `06c_outer[X]_ai_generated_meshlib_script_[Z].py`: Every custom Python script the AI Inspector wrote to measure the mesh.
+*   `07_outer[X]_adversarial_reviewer_verdict.json`: The final decision by the Reviewer Agent. If this says "REDESIGN", the pipeline loops back to step 02 and tries again!
 
 ---
 
-## Module Breakdown
+## 🚀 Installation & Execution
 
-### 1. Master Pipeline Orchestrator (`pipeline.py`)
-The deterministic controller of the system.
-*   **Job Directory Setup**: Creates a timestamped folder `outputs/run_YYYYMMDD_HHMMSS/` for every execution.
-*   **Target Extraction**: Extracts expected 3D bounds dynamically.
-*   **Self-Healing Code Loop**: Invokes the LLM to write CadQuery code. Iteratively repairs failing code up to 3 times based on execution stack traces.
-*   **Artifact Generation**: Automatically exports the solid to both boundary representation (`.step`) and tessellated mesh (`.stl`) formats.
-*   **QA Run**: Triggers the static and autonomous validation suites.
-
-### 2. LLM Engine (`src/llm.py`)
-Manages all interactions with the Gemini API using the new `google-genai` SDK.
-*   Generates standard CadQuery scripts based on engineering prompts.
-*   Extracts geometric dimension expectations dynamically into JSON form.
-
-### 3. Isolated CAD Executor (`src/cad_executor.py`)
-Handles runtime evaluation of generated geometry scripts using Python's dynamic `exec()`. Evaluates the CadQuery code in a local namespace to ensure security and captures the final `result_solid` object.
-
-### 4. MeshLib Autonomous Inspector Agent (`agents/meshlib_agent/`)
-An advanced autonomous agent built using the **Google ADK**.
-*   **`agent.py`**: The brain. Reads the physical blueprint, writes MeshLib python code to measure and verify properties, calls tools to execute that code, automatically repairs the code if it fails, and provides a final structural verdict.
-*   **`sandbox_executor.py`**: A vital security layer. Since MeshLib utilizes a C++ backend (OCCT) that will Segfault on bad memory allocations, the agent's code runs in a completely isolated subprocess. This protects the parent pipeline from fatal crashes.
-
-### 5. Advanced Static Inspection (`src/mesh_inspector.py`)
-Provides fast, invariant baseline checks using MeshLib before the agent assumes control.
-*   **Watertightness & Volume**: Confirms the mesh is topologically closed.
-*   **Self-Intersections & Degenerate Faces**: Flags structural mesh errors that cause rendering or printing issues.
-*   **Wall Thickness**: Uses raycasting to verify minimum structural limits.
-
-### 6. Unified Logger (`src/logger.py`)
-Implements an agentic log system routing INFO logs to the terminal and detailed DEBUG traces (including raw LLM outputs) to `pipeline.log`.
-
----
-
-## Installation & Setup
-
-### Environment Variables
-Create a `.env` file in the root directory and add your Google Gemini API key:
+### 1. Set your API Key
+Create a `.env` file in the root of the project and add your Gemini API key:
 ```env
 GEMINI_API_KEY=your_actual_gemini_api_key_here
 ```
 
-### Option A: Local Installation (Condo/Mamba)
-Because CadQuery and MeshLib depend on complex compiled C++ binaries, it is highly recommended to manage the environment using Conda:
+### 2. Run the Pipeline in Docker (Recommended)
+Because CAD operations rely on complex C++ binaries, it is highly recommended to run this pipeline via Docker so you don't mess up your local Python environment.
 
-1.  **Create and activate the environment**:
-    ```bash
-    conda create -n agentic-cad python=3.10 -y
-    conda activate agentic-cad
-    ```
-2.  **Install CadQuery** (using official channels):
-    ```bash
-    conda install -y -c cadquery -c conda-forge cadquery
-    ```
-3.  **Install MeshLib & Python dependencies**:
-    ```bash
-    pip install meshlib google-genai pydantic python-dotenv
-    ```
-
-### Option B: Docker Setup (Recommended for Isolation)
-To run the entire pipeline inside a clean, reproducible containerized environment. The Dockerfile compiles CadQuery and installs dependencies (`google-adk`, `fastapi`, `uvicorn`, `meshlib` etc.) required to execute the pipeline and serve the agent UI.
-
-1.  **Build the Docker image**:
-    ```bash
-    docker build -t agentic-cad-pipeline .
-    ```
-2.  **Run the container** (passing your API key as an environment variable):
-    ```bash
-    docker run --env-file .env -v "$(pwd)/outputs:/app/outputs" agentic-cad-pipeline
-    ```
-    *Note: The `-v` flag mounts the local `outputs/` folder to access step files, STL files, logs, and JSON reports generated inside the container.*
-
----
-
-## Verification and Execution
-
-### Running the Pipeline
-To launch the centrifugal impeller test case:
+**Build the Docker Image:**
 ```bash
-python pipeline.py
+docker build -t agentic-cad-pipeline .
 ```
 
-### Google ADK Agent Console & Server Commands
-You can run the ADK Agent Web Console or the API Server locally using the workspace virtual environment. To share and view agent logs generated from `pipeline.py` or `observe.py` executions, point the commands to the shared SQLite database and use distinct ports to avoid port binding conflicts:
+**Run the Pipeline (Non-Interactive):**
+```bash
+docker run --env-file .env -v "$(pwd)/outputs:/app/outputs" agentic-cad-pipeline python pipeline.py
+```
+*(The `-v` flag mounts the `/app/outputs` folder inside the container to the `outputs/` folder on your actual computer, so the CAD files are saved directly to your hard drive).*
 
-*   **FastAPI Web UI Console (With Step-by-Step History Log):**
-    ```bash
-    ./agents/.agnts/bin/python -m google.adk.cli web --session_service_uri sqlite:///outputs/adk_sessions.db --port 8080 agents
-    ```
-    *Open `http://127.0.0.1:8080` in your browser. Click the **Sessions** tab in the sidebar and select a session to view the exact step-by-step reasoning timeline, generated code tools, execution logs, and final verdicts.*
+### 3. View the AI's Thoughts in the Web UI
+This system uses the Google ADK, which comes with a beautiful Web UI that lets you see the internal reasoning, tool calls, and error traces of the AI agents in real-time.
 
-*   **FastAPI REST API Server (Programmatic Agent Access):**
-    ```bash
-    ./agents/.agnts/bin/python -m google.adk.cli api_server --session_service_uri sqlite:///outputs/adk_sessions.db --port 8000 agents
-    ```
-    *Serves the agent over standard REST endpoints at `http://127.0.0.1:8000` while logging run events to the same SQLite database.*
-
-### Live Console Observability & Debugging
-To inspect the internal reasoning, code generation, and sandboxed execution output of the MeshLib Agent in real-time with colorized terminal logging:
-
-1.  **Run the live inspector shell utility**:
-    ```bash
-    python agents/meshlib_agent/observe.py
-    ```
-2.  Follow the prompts or supply arguments to inspect specific STL files and view full agent thoughts, python code generation, raw sandboxed compiler tracebacks, and classification verdicts.
-
-### Output Artifacts
-Inside `outputs/run_[timestamp]/`, you will find:
-*   `generated_code_attempt_[N].py`: The code drafted by the LLM on attempt N.
-*   `pipeline.log`: Complete debug log of all generation steps, CAD compilation, and inspection traces.
-*   `model.step`: Boundary representation model, ready for importing into professional CAD suites.
-*   `model.stl`: Tessellated mesh, ready for 3D printing slicing.
-*   `ai_inspection_verdict.json`: The final classification verdict dynamically generated by the ADK agent.
-*   `inspection_report.json`: Detailed static JSON structure indicating the geometric/topological baseline status of the mesh.
+To launch the UI locally on your machine, run:
+```bash
+./agents/.agnts/bin/python -m google.adk.cli web --session_service_uri sqlite:///outputs/adk_sessions.db --port 8080 agents
+```
+Then, open `http://127.0.0.1:8080` in your web browser. Click the **Sessions** tab on the left to review the exact step-by-step reasoning for `planner_agent`, `meshlib_agent`, and `reviewer_agent`.

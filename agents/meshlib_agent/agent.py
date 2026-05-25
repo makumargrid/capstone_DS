@@ -1,6 +1,13 @@
+"""
+MeshLib Inspector Agent — Findings-only, no verdict power.
+
+This agent analyzes 3D mesh files against design specifications using MeshLib.
+It reports WHAT it measured and any discrepancies, but does NOT make pass/fail
+decisions. The Reviewer Agent makes routing decisions.
+"""
+
 import json
 import os
-# Force google-genai / google-adk to use Developer API instead of Vertex AI
 os.environ['GOOGLE_GENAI_USE_VERTEXAI'] = 'false'
 
 import logging
@@ -13,8 +20,10 @@ from google.genai import types
 
 from .sandbox_executor import run_in_sandbox, run_invariant_baseline
 
-# Initialize counter for saving generated scripts
+# Globals for routing tool outputs to the correct run directory
 _script_counter = 0
+_current_output_dir = "outputs/run_latest"
+_current_outer_attempt = 1
 
 def execute_meshlib_code(script_content: str, mesh_path: str) -> dict:
     """Executes a Python script using meshlib.mrmeshpy in an isolated subprocess to inspect a 3D mesh file.
@@ -38,13 +47,13 @@ def execute_meshlib_code(script_content: str, mesh_path: str) -> dict:
         - crash_type: str or None
         - generated_code: str
     """
-    global _script_counter
+    global _script_counter, _current_output_dir, _current_outer_attempt
     _script_counter += 1
     
-    # Save the generated script for traceability
+    # Save the generated script for traceability in the run directory
     try:
-        os.makedirs("outputs/generated_inspections", exist_ok=True)
-        filename = f"outputs/generated_inspections/generated_inspection_{_script_counter}.py"
+        os.makedirs(_current_output_dir, exist_ok=True)
+        filename = os.path.join(_current_output_dir, f"06c_outer{_current_outer_attempt}_ai_generated_meshlib_script_{_script_counter}.py")
         with open(filename, "w") as f:
             f.write(script_content)
     except Exception as e:
@@ -52,119 +61,158 @@ def execute_meshlib_code(script_content: str, mesh_path: str) -> dict:
 
     return run_in_sandbox(script_content, mesh_path)
 
-# Detailed System Instruction for the MeshLib Geometry Inspector Agent
-INSTRUCTION = """You are a MeshLib Geometry Inspector that analyzes 3D mesh files against design specifications.
+def explore_meshlib_api(attribute_path: str = "") -> str:
+    """
+    Dynamically explores the meshlib.mrmeshpy Python module.
+    Use this tool when you are unsure about the exact API method name or arguments.
+    
+    Args:
+        attribute_path: A dot-separated string representing the attribute to explore.
+                        Pass an empty string "" to see top-level attributes of mrmeshpy.
+                        Pass "Mesh" to see methods of the Mesh class.
+                        Pass "topology" to explore topology functions.
+    
+    Returns:
+        A string containing a list of available public attributes and their brief docstrings.
+    """
+    import meshlib.mrmeshpy as mrmesh
+    try:
+        if not attribute_path:
+            obj = mrmesh
+        else:
+            obj = mrmesh
+            for part in attribute_path.split('.'):
+                obj = getattr(obj, part)
+        
+        attributes = dir(obj)
+        public_attrs = [a for a in attributes if not a.startswith('_')]
+        
+        result = f"Attributes of mrmeshpy.{attribute_path if attribute_path else 'mrmeshpy'}:\n"
+        
+        count = 0
+        for a in public_attrs:
+            if count > 60:
+                result += f"... and {len(public_attrs) - 60} more attributes omitted.\n"
+                break
+            try:
+                attr_obj = getattr(obj, a)
+                doc = attr_obj.__doc__ or "No docstring available."
+                doc_brief = doc.strip().split('\n')[0][:120]
+                result += f"- {a}: {doc_brief}\n"
+            except Exception:
+                result += f"- {a}\n"
+            count += 1
+            
+        return result
+    except AttributeError:
+        return f"Error: Attribute '{attribute_path}' not found in meshlib.mrmeshpy."
+    except Exception as e:
+        return f"Error exploring module: {e}"
+
+
+# System Instruction — Findings-only, NO verdict power
+INSTRUCTION = """You are a MeshLib Geometry Inspector. You analyze 3D mesh files against design specifications.
+
+CRITICAL: You report FINDINGS ONLY. You do NOT decide whether the design passes or fails.
+A separate Reviewer Agent will make that decision based on your findings.
 
 Your workflow:
-1. Read the primitive plan to understand every declared dimension and feature.
-2. Identify which properties of this specific design are measurable with MeshLib.
-3. Write Python code using ONLY the allowed MeshLib APIs.
-4. Call execute_meshlib_code to run the code.
-5. If the tool returns success=False, rewrite the code to fix the crash_type issue.
-6. If checks fail, classify the failure using the taxonomy below.
-7. Produce a final JSON verdict.
+1. Read the design brief to understand every declared dimension and feature.
+2. Identify which properties are measurable with MeshLib.
+3. If you do not know the exact MeshLib function, use `explore_meshlib_api` to discover it.
+4. Write Python code using the discovered APIs.
+5. Call `execute_meshlib_code` to run the code.
+6. If the tool returns success=False, rewrite the code to fix the crash_type issue.
+7. Report ALL findings — passed checks AND failed checks — with exact measurements.
 
-Allowed MeshLib APIs (DO NOT use any other methods or classes):
-- mesh.topology.isClosed()
-- mesh.topology.numValidFaces()
-- mesh.topology.numValidVerts()
-- mesh.topology.findHoleRepresentiveEdges()
-- mesh.topology.hasFace(mrmesh.FaceId(int))
-- mesh.topology.getTriVerts(mrmesh.FaceId(int))
-- mesh.volume()
-- mesh.computeBoundingBox() -> returns box where box.min and box.max have .x, .y, .z attributes
-- mesh.normal(mrmesh.FaceId(int)) -> returns Vector3f with .x, .y, .z attributes
-- mesh.points.vec[mrmesh.VertId(int)] -> returns Vector3f with .x, .y, .z
-- mrmesh.findSelfIntersections(mesh) or mrmesh.localFindSelfIntersections(mesh)
-- mrmesh.Line3f(origin, direction)
-- mrmesh.rayMeshIntersect(mesh_part, ray, min_d, max_d) -> Note: mesh_part is instantiated as mrmesh.MeshPart(mesh). It returns a MeshIntersectionResult which has a `distanceAlongLine` float attribute representing the distance from the ray origin to the intersection. Do NOT use hit_point or distance.
-- mrmesh.Vector3f(x, y, z)
-- mrmesh.cross(v1, v2)
-- mrmesh.FaceId(int)
-- mrmesh.VertId(int)
+API Discovery:
+- Use `explore_meshlib_api` to dynamically search for functions, classes, and properties.
+- Call with "" for top-level, "Mesh" for Mesh methods, etc.
+- Always read docstrings to ensure correct argument types.
 
 Generated Code Rules:
-- The variables `mesh` and `mesh_path` are pre-defined. NEVER redefine or load them in your code.
+- `mesh` and `mesh_path` are pre-defined. NEVER redefine or load them.
 - Only import: `import meshlib.mrmeshpy as mrmesh`.
-- The final output of the script must populate the pre-defined list `check_results` with dictionaries.
-- Each dictionary in `check_results` MUST have the keys: "check_name", "measured", "expected", "passed", "unit", "reason".
-- DO NOT wrap your script in try/except blocks. Let errors propagate so the sandbox captures the crash_type.
+- Populate the pre-defined list `check_results` with dictionaries.
+- Each dict MUST have keys: "check_name", "measured", "expected", "passed", "unit", "reason".
+- DO NOT wrap in try/except. Let errors propagate for crash detection.
 - Never write files, read files (other than mesh_path), or make network calls.
 
-Mandatory Checks to Implement (always):
-1. Bounding Box & Dimensions: Every numeric dimension (length, width, height, radius, etc.) in the plan must be measured and compared.
-2. Holes/Bores: Every hole/bore must have its diameter measured.
-3. Wall Thickness: If min_wall_mm is specified, check wall thickness using ray casting from face centers inward.
+Mandatory Checks (always implement):
+1. Bounding Box & Dimensions: measure every numeric dimension from the design brief.
+2. Holes/Bores: measure diameter of every declared hole/bore.
+3. Wall Thickness: if min_wall_mm is specified, use ray casting from face centers inward.
 4. Manufacturing Constraints:
-   - If manufacturing_process is "FDM_3D_print": check no face normal has z-component below -0.7 (overhang > 45 degrees), and minimum wall thickness > 1.2mm.
-   - If manufacturing_process is "CNC_3axis": verify features are accessible from all 6 orthogonal directions.
+   - FDM_3D_print: check overhang angles, minimum wall > 1.2mm.
+   - CNC_3axis: verify feature accessibility from 6 orthogonal directions.
 
-Failure Taxonomy:
-- Class A - Mesh artifact: auto-repair safe (e.g., tiny degenerate triangles, minor floating point gaps under 0.001mm).
-- Class B - Repairable geometry defect: needs repair + re-measure (e.g., small holes in mesh, export artifacts at fillet locations).
-- Class C - Design intent failure: route back to the design planner, NEVER repair the mesh (e.g., wrong dimensions, wall too thin, impossible constraint - the PLAN was wrong, not the mesh).
-- Class D - Ambiguous: human review required (e.g., SEGFAULT, multiple conflicting failure types, cannot determine root cause).
-
-Final Output format:
-Produce a final JSON object with these exact keys, and no extra markdown wrapping:
+Output ONLY a JSON object with these exact keys (no markdown wrapping):
 {
-  "overall_passed": bool,
-  "failure_class": "A" | "B" | "C" | "D" | null,
-  "failures": [
+  "checks": [
     {
-      "check": "check_name",
-      "measured": "measured value",
-      "expected": "expected value",
-      "severity": "WARNING" | "CRITICAL"
+      "check_name": "string",
+      "measured": "number or string",
+      "expected": "number or string",
+      "tolerance": "number or null",
+      "passed": true/false,
+      "unit": "mm or degrees or count",
+      "reason": "explanation"
     }
   ],
-  "passed_checks": ["list of passed check names"],
-  "engineer_summary": "One short paragraph a human engineer can read in 10 seconds.",
-  "repair_recommendation": "string explaining what the planner should change, or null if passed"
+  "anomalies": ["list of unexpected observations not covered by checks"],
+  "engineer_summary": "One paragraph a human engineer can read in 10 seconds",
+  "confidence": "HIGH | MEDIUM | LOW"
 }
 """
 
 root_agent = Agent(
     name="meshlib_inspector",
-    model="gemini-2.5-flash",
-    description="Inspects 3D mesh files against a design specification using MeshLib, writes custom geometry checks at runtime, and classifies any failures into a structured taxonomy.",
+    model="gemini-3.1-pro-preview",
+    description="Inspects 3D mesh files against a design specification using MeshLib. Reports findings only — does not make pass/fail decisions.",
     instruction=INSTRUCTION,
-    tools=[execute_meshlib_code],
+    tools=[execute_meshlib_code, explore_meshlib_api],
 )
 
-def run_inspection(mesh_path: str, primitive_plan: dict) -> dict:
-    """Convenience runner function that pipeline.py will call to run a full inspection."""
+
+def run_inspection(mesh_path: str, design_brief: dict, output_dir: str, outer_attempt: int = 1) -> dict:
+    """Run the MeshLib inspection agent and return structured findings.
+    
+    Args:
+        mesh_path: Path to the STL file.
+        design_brief: The design specification dict.
+        output_dir: The timestamped directory for saving outputs.
+        outer_attempt: The current iteration of the outer redesign loop.
+    
+    Returns:
+        A dict with keys: checks, anomalies, engineer_summary, confidence.
+    """
+    global _current_output_dir, _current_outer_attempt, _script_counter
+    _current_output_dir = output_dir
+    _current_outer_attempt = outer_attempt
+    _script_counter = 0  # Reset per outer iteration for clean numbering
     
     # 1. Run invariant baseline
     baseline = run_invariant_baseline(mesh_path)
     if baseline.get("load_failed"):
         return {
-            "overall_passed": False,
-            "failure_class": "D",
-            "failures": [
-                {
-                    "check": "load_mesh",
-                    "measured": "failed",
-                    "expected": "valid mesh",
-                    "severity": "CRITICAL"
-                }
-            ],
-            "passed_checks": [],
-            "engineer_summary": f"Mesh loading failed: {baseline.get('hard_failures', ['Unknown error'])[0]}",
-            "repair_recommendation": "Check if the mesh file exists, is not empty, and is in a valid STL format."
+            "checks": [],
+            "anomalies": [f"Mesh loading failed: {baseline.get('hard_failures', ['Unknown'])[0]}"],
+            "engineer_summary": "The mesh file could not be loaded for inspection.",
+            "confidence": "HIGH"
         }
 
-    # 2. Build initial message
+    # 2. Build the message for the agent
     message = (
         f"Mesh Path: {mesh_path}\n\n"
-        f"Primitive Plan:\n{json.dumps(primitive_plan, indent=2)}\n\n"
+        f"Design Brief:\n{json.dumps(design_brief, indent=2)}\n\n"
         f"Baseline Results:\n{json.dumps(baseline, indent=2)}\n\n"
         f"Instruction: The baseline has already checked watertightness, volume, "
-        f"self-intersections, and bounding box — do not repeat these, "
-        f"focus on plan-specific dimensional and feature verification."
+        f"self-intersections, and bounding box — do not repeat these. "
+        f"Focus on plan-specific dimensional and feature verification. "
+        f"Report ALL findings with exact measurements."
     )
 
-    # 3. Set up DatabaseSessionService and session for persistent storage and Web UI observability
+    # 3. Set up session
     session_id = str(uuid.uuid4())
     db_dir = "outputs"
     os.makedirs(db_dir, exist_ok=True)
@@ -187,33 +235,21 @@ def run_inspection(mesh_path: str, primitive_plan: dict) -> dict:
         session_service=session_service
     )
 
-    # 5. Build Content
+    # 5. Run
     content = types.Content(role='user', parts=[types.Part(text=message)])
-
-    # 6. Run
     events = []
     try:
         events = list(runner.run(user_id="user", session_id=session_id, new_message=content))
     except Exception as e:
-        logging.getLogger("google_adk").error(f"Error during agent run: {e}")
-        verdict = {
-            "overall_passed": False,
-            "failure_class": "D",
-            "failures": [
-                {
-                    "check": "agent_execution",
-                    "measured": "Gemini API Error",
-                    "expected": "successful agent reasoning",
-                    "severity": "CRITICAL"
-                }
-            ],
-            "passed_checks": [],
-            "engineer_summary": f"The Gemini API call failed: {e}",
-            "repair_recommendation": "API capacity limits or temporary unavailability occurred. Try again later or switch to a fallback model."
+        logging.getLogger("google_adk").error(f"MeshLib agent error: {e}")
+        return {
+            "checks": [],
+            "anomalies": [f"Agent execution failed: {e}"],
+            "engineer_summary": f"The MeshLib inspection agent failed: {e}",
+            "confidence": "LOW"
         }
-        return verdict
 
-    # 7. Collect the final response
+    # 6. Extract final response
     final_text = None
     for event in events:
         if event.is_final_response():
@@ -221,51 +257,32 @@ def run_inspection(mesh_path: str, primitive_plan: dict) -> dict:
                 final_text = event.content.parts[0].text
                 break
 
-    # 8. Parse the final response text as JSON
+    # 7. Parse JSON
     if final_text:
-        cleaned_text = final_text.replace('```json', '').replace('```', '').strip()
+        cleaned = final_text.replace('```json', '').replace('```', '').strip()
         try:
-            verdict = json.loads(cleaned_text)
-            # Ensure required keys exist
-            required_keys = ["overall_passed", "failure_class", "failures", "passed_checks", "engineer_summary", "repair_recommendation"]
-            for key in required_keys:
-                if key not in verdict:
-                    verdict[key] = None
-                    
-            # 10. Save the full events list for debugging
+            findings = json.loads(cleaned)
+            for key in ["checks", "anomalies", "engineer_summary", "confidence"]:
+                if key not in findings:
+                    findings[key] = [] if key in ("checks", "anomalies") else None
+            
+            # Save conversation for debugging
             try:
-                os.makedirs("outputs/run_latest", exist_ok=True)
-                with open("outputs/run_latest/agent_conversation.json", "w") as f:
+                os.makedirs(output_dir, exist_ok=True)
+                convo_path = os.path.join(output_dir, f"06b_outer{outer_attempt}_ai_inspector_conversation_trace.json")
+                with open(convo_path, "w") as f:
                     json.dump([e.model_dump(mode='json') for e in events], f, indent=4)
             except Exception:
                 pass
-                
-            return verdict
-        except Exception:
+            
+            return findings
+        except json.JSONDecodeError:
             pass
 
-    # 9. Handle failure to parse JSON
-    verdict = {
-        "overall_passed": False,
-        "failure_class": "D",
-        "failures": [
-            {
-                "check": "parse_verdict_json",
-                "measured": "invalid JSON or empty response",
-                "expected": "valid JSON response",
-                "severity": "CRITICAL"
-            }
-        ],
-        "passed_checks": [],
-        "engineer_summary": final_text if final_text else "No response received from agent.",
-        "repair_recommendation": "JSON parse failed — inspect agent_conversation log"
+    # 8. Fallback
+    return {
+        "checks": [],
+        "anomalies": [f"Could not parse agent response: {final_text}"],
+        "engineer_summary": final_text or "No response received from agent.",
+        "confidence": "LOW"
     }
-
-    try:
-        os.makedirs("outputs/run_latest", exist_ok=True)
-        with open("outputs/run_latest/agent_conversation.json", "w") as f:
-            json.dump([e.model_dump(mode='json') for e in events], f, indent=4)
-    except Exception:
-        pass
-
-    return verdict
